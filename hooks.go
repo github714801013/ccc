@@ -114,15 +114,17 @@ func extractLastTurn(transcriptPath string) []string {
 		Content string `json:"content,omitempty"`
 	}
 
-	type message struct {
-		Role    string         `json:"role"`
-		Content json.RawMessage `json:"content"`
-	}
-
+	// transcriptLine handles both nested (message.content) and flat (root-level
+	// content) JSONL formats. Claude Code v2.1.45+ may emit either.
 	type transcriptLine struct {
-		Type      string  `json:"type"`
-		RequestID string  `json:"requestId,omitempty"`
-		Message   message `json:"message"`
+		Type      string          `json:"type"`
+		RequestID string          `json:"requestId,omitempty"`
+		Role      string          `json:"role,omitempty"`
+		Content   json.RawMessage `json:"content,omitempty"`
+		Message   struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
 	}
 
 	// Parse all lines
@@ -145,11 +147,20 @@ func extractLastTurn(transcriptPath string) []string {
 		if json.Unmarshal(line, &tl) != nil {
 			continue
 		}
+		// Use nested message fields if present, otherwise fall back to root-level fields
+		role := tl.Message.Role
+		content := tl.Message.Content
+		if role == "" {
+			role = tl.Role
+		}
+		if len(content) == 0 {
+			content = tl.Content
+		}
 		entries = append(entries, parsedEntry{
 			ttype:     tl.Type,
 			requestID: tl.RequestID,
-			role:      tl.Message.Role,
-			content:   tl.Message.Content,
+			role:      role,
+			content:   content,
 		})
 	}
 

@@ -273,6 +273,32 @@ func TestExtractLastTurn(t *testing.T) {
 {"type":"assistant","requestId":"req_3","message":{"role":"assistant","content":[{"type":"text","text":"All done!"}]}}`,
 			expected: []string{"Let me check that", "All done!"},
 		},
+		{
+			name: "flat format v2.1.45 - content at root level",
+			content: `{"type":"user","role":"user","content":[{"type":"text","text":"hello"}],"requestId":"req_1"}
+{"type":"assistant","role":"assistant","model":"claude-opus-4-6","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","requestId":"req_2"}`,
+			expected: []string{"OK"},
+		},
+		{
+			name: "flat format with duplicate type field",
+			content: `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"]},"requestId":"req_1","type":"user"}
+{"type":"assistant","message":{"model":"claude-opus-4-6","role":"assistant","content":[{"type":"text","text":"World"}],"stop_reason":null},"requestId":"req_2","type":"assistant"}`,
+			expected: []string{"World"},
+		},
+		{
+			name: "flat format with tool_use and tool_result",
+			content: `{"type":"user","role":"user","content":[{"type":"text","text":"list files"}],"requestId":"req_1"}
+{"type":"assistant","role":"assistant","content":[{"type":"text","text":"Let me check"},{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls"}}],"requestId":"req_2"}
+{"type":"user","role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"file1.txt\nfile2.txt"}],"requestId":"req_3"}
+{"type":"assistant","role":"assistant","content":[{"type":"text","text":"Found 2 files."}],"requestId":"req_4"}`,
+			expected: []string{"Let me check", "Found 2 files."},
+		},
+		{
+			name: "mixed nested and flat formats in same transcript",
+			content: `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]},"requestId":"req_1"}
+{"type":"assistant","role":"assistant","content":[{"type":"text","text":"Hi from flat format!"}],"requestId":"req_2"}`,
+			expected: []string{"Hi from flat format!"},
+		},
 	}
 
 	for _, tt := range tests {
