@@ -31,6 +31,86 @@ func clearThinking(sessionName string) {
 	os.Remove(thinkingFlag(sessionName))
 }
 
+// toolStatePath returns the path for tool call display state
+func toolStatePath(sessionName string) string {
+	return filepath.Join(cacheDir(), "tools-"+sessionName+".json")
+}
+
+// ToolState tracks tool calls and the Telegram message ID for live updates
+type ToolState struct {
+	MsgID int64      `json:"msg_id"`
+	Tools []ToolCall `json:"tools"`
+}
+
+type ToolCall struct {
+	Name  string `json:"name"`
+	Input string `json:"input"`
+	Done  bool   `json:"done"`
+}
+
+func loadToolState(sessionName string) *ToolState {
+	data, err := os.ReadFile(toolStatePath(sessionName))
+	if err != nil {
+		return &ToolState{}
+	}
+	var state ToolState
+	if json.Unmarshal(data, &state) != nil {
+		return &ToolState{}
+	}
+	return &state
+}
+
+func saveToolState(sessionName string, state *ToolState) {
+	data, _ := json.Marshal(state)
+	os.WriteFile(toolStatePath(sessionName), data, 0600)
+}
+
+func clearToolState(sessionName string) {
+	os.Remove(toolStatePath(sessionName))
+}
+
+// formatToolMessage builds the display text from tool state
+func formatToolMessage(state *ToolState) string {
+	var lines []string
+	for _, t := range state.Tools {
+		icon := "⚙️"
+		if t.Done {
+			icon = "✅"
+		}
+		if t.Input != "" {
+			lines = append(lines, fmt.Sprintf("%s %s: %s", icon, t.Name, t.Input))
+		} else {
+			lines = append(lines, fmt.Sprintf("%s %s", icon, t.Name))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// toolInputSummary extracts a short description from tool input
+func toolInputSummary(hookData HookData) string {
+	switch hookData.ToolName {
+	case "Bash":
+		cmd := hookData.ToolInput.Command
+		if len(cmd) > 80 {
+			cmd = cmd[:80] + "..."
+		}
+		return cmd
+	case "Read", "Write", "Edit":
+		return hookData.ToolInput.FilePath
+	case "Grep":
+		return hookData.ToolInput.Description
+	case "Glob":
+		return hookData.ToolInput.Description
+	case "Task":
+		return hookData.ToolInput.Description
+	default:
+		if hookData.ToolInput.Description != "" {
+			return hookData.ToolInput.Description
+		}
+		return ""
+	}
+}
+
 // readHookStdin reads stdin JSON with a timeout
 func readHookStdin() ([]byte, error) {
 	stdinData := make(chan []byte, 1)
@@ -133,6 +213,7 @@ func handleStopHook() error {
 	tmuxName := "claude-" + strings.ReplaceAll(sessName, ".", "_")
 	os.Remove(telegramActiveFlag(tmuxName))
 	clearThinking(sessName)
+	clearToolState(sessName)
 
 	// Retry extractLastTurn a few times - transcript may not be fully flushed yet
 	var blocks []string
@@ -353,6 +434,29 @@ func handlePermissionHook() error {
 	// Persist claude session ID to config for future lookups
 	persistClaudeSessionID(config, sessName, hookData.SessionID)
 
+	// Update tool call display (fire-and-forget, don't block permission decision)
+	if hookData.ToolName != "" && hookData.ToolName != "AskUserQuestion" && topicID != 0 {
+		go func() {
+			defer func() { recover() }()
+			state := loadToolState(sessName)
+			state.Tools = append(state.Tools, ToolCall{
+				Name:  hookData.ToolName,
+				Input: toolInputSummary(hookData),
+				Done:  false,
+			})
+			text := formatToolMessage(state)
+			if state.MsgID == 0 {
+				msgID, err := sendMessageGetID(config, config.GroupID, topicID, text)
+				if err == nil && msgID > 0 {
+					state.MsgID = msgID
+				}
+			} else {
+				editMessage(config, config.GroupID, state.MsgID, topicID, text)
+			}
+			saveToolState(sessName, state)
+		}()
+	}
+
 	// Handle AskUserQuestion - forward to Telegram with buttons
 	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
 		for qIdx, q := range hookData.ToolInput.Questions {
@@ -515,6 +619,7 @@ func handleUserPromptHook() error {
 	}
 
 	persistClaudeSessionID(config, sessName, hookData.SessionID)
+	clearToolState(sessName)
 
 	// Skip if this prompt came from Telegram (already visible in the chat).
 	// The flag is consumed (deleted) so subsequent TUI prompts are not skipped.
@@ -529,6 +634,45 @@ func handleUserPromptHook() error {
 
 	setThinking(sessName)
 	sendMessage(config, config.GroupID, topicID, fmt.Sprintf("💬 %s", hookData.Prompt))
+	return nil
+}
+
+func handlePostToolHook() error {
+	defer func() { recover() }()
+
+	rawData, _ := readHookStdin()
+	if len(rawData) == 0 {
+		return nil
+	}
+
+	hookData, err := parseHookData(rawData)
+	if err != nil {
+		return nil
+	}
+
+	config, err := loadConfig()
+	if err != nil || config == nil {
+		return nil
+	}
+
+	sessName, topicID := findSession(config, hookData.Cwd, hookData.SessionID)
+	if sessName == "" || config.GroupID == 0 || topicID == 0 {
+		return nil
+	}
+
+	state := loadToolState(sessName)
+	// Mark the last matching tool as done
+	for i := len(state.Tools) - 1; i >= 0; i-- {
+		if state.Tools[i].Name == hookData.ToolName && !state.Tools[i].Done {
+			state.Tools[i].Done = true
+			break
+		}
+	}
+
+	if state.MsgID > 0 {
+		editMessage(config, config.GroupID, state.MsgID, topicID, formatToolMessage(state))
+	}
+	saveToolState(sessName, state)
 	return nil
 }
 
@@ -604,6 +748,16 @@ func installHook() error {
 				"hooks": []interface{}{
 					map[string]interface{}{
 						"command": cccPath + " hook-stop",
+						"type":    "command",
+					},
+				},
+			},
+		},
+		"PostToolUse": {
+			map[string]interface{}{
+				"hooks": []interface{}{
+					map[string]interface{}{
+						"command": cccPath + " hook-post-tool",
 						"type":    "command",
 					},
 				},

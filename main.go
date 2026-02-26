@@ -346,6 +346,12 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "hook-post-tool":
+		if err := handlePostToolHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "hook-user-prompt":
 		if err := handleUserPromptHook(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
