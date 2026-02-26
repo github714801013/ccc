@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -304,16 +305,16 @@ func handleStopHook() error {
 	clearThinking(sessName)
 
 	// Deliver unsent texts as separate messages (these come after all tools)
-	// Retry briefly if nothing found — transcript may not be flushed yet when stop hook fires.
 	hookLog("stop-hook: delivering unsent texts")
 	sent := deliverUnsentTexts(config, sessName, topicID, hookData.TranscriptPath, false)
-	if sent == 0 {
-		hookLog("stop-hook: sent=0, retrying after 1s (transcript flush race)")
-		time.Sleep(1 * time.Second)
-		sent = deliverUnsentTexts(config, sessName, topicID, hookData.TranscriptPath, false)
-	}
 	hookLog("stop-hook: sent=%d", sent)
 	clearToolState(sessName)
+
+	// Background retry: transcript may not be flushed yet when stop hook fires.
+	// Spawn a detached subprocess that retries 3 times at 2-second intervals.
+	// (goroutines die when the hook process exits, so we need a separate process)
+	cmd := exec.Command(cccPath, "hook-stop-retry", sessName, fmt.Sprintf("%d", topicID), hookData.TranscriptPath)
+	cmd.Start()
 
 	return nil
 }
@@ -503,6 +504,22 @@ func extractRecentAssistantTexts(transcriptPath string, tailCount int) []assista
 	return result
 }
 
+
+// handleStopRetry is a background process spawned by stop hook.
+// It retries transcript reading 3 times at 2-second intervals to catch
+// messages that weren't flushed when the stop hook first fired.
+func handleStopRetry(sessName string, topicID int64, transcriptPath string) error {
+	config, err := loadConfig()
+	if err != nil || config == nil {
+		return nil
+	}
+	for i := 0; i < 3; i++ {
+		time.Sleep(2 * time.Second)
+		n := deliverUnsentTexts(config, sessName, topicID, transcriptPath, false)
+		hookLog("stop-retry: %d/3 sent=%d session=%s", i+1, n, sessName)
+	}
+	return nil
+}
 
 func handlePermissionHook() error {
 	defer func() { recover() }()
