@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const defaultTmuxSession = "ccc"
+
 var (
 	tmuxPath   string
 	cccPath    string
@@ -60,33 +62,111 @@ func initPaths() {
 	}
 }
 
-func tmuxSessionExists(name string) bool {
-	cmd := exec.Command(tmuxPath, "has-session", "-t", name)
-	return cmd.Run() == nil
+// getTargetSession returns an existing tmux session name, or creates one if none exist
+func getTargetSession() (string, error) {
+	// Try to find any existing session
+	cmd := exec.Command(tmuxPath, "list-sessions", "-F", "#{session_name}")
+	out, err := cmd.Output()
+	if err == nil {
+		scanner := bufio.NewScanner(bytes.NewReader(out))
+		for scanner.Scan() {
+			name := scanner.Text()
+			if name != "" {
+				return name, nil
+			}
+		}
+	}
+	// No sessions exist, create one
+	c := exec.Command(tmuxPath, "new-session", "-d", "-s", defaultTmuxSession)
+	if err := c.Run(); err != nil {
+		return "", err
+	}
+	exec.Command(tmuxPath, "set-option", "-t", defaultTmuxSession, "mouse", "on").Run()
+	return defaultTmuxSession, nil
 }
 
-func createTmuxSession(name string, workDir string, continueSession bool) error {
-	// Build the command to run inside tmux
+// tmuxTargetByID returns the window ID if available, otherwise falls back to name lookup
+func tmuxTargetByID(windowID string, windowName string) string {
+	if windowID != "" {
+		return windowID
+	}
+	return tmuxTargetByName(windowName)
+}
+
+// tmuxTargetByName finds a window target by name (fallback)
+func tmuxTargetByName(windowName string) string {
+	cmd := exec.Command(tmuxPath, "list-windows", "-a", "-F", "#{window_id}\t#{window_name}")
+	out, err := cmd.Output()
+	if err == nil {
+		scanner := bufio.NewScanner(bytes.NewReader(out))
+		for scanner.Scan() {
+			parts := strings.SplitN(scanner.Text(), "\t", 2)
+			if len(parts) == 2 && parts[1] == windowName {
+				return parts[0] // return window ID
+			}
+		}
+	}
+	return defaultTmuxSession + ":" + windowName
+}
+
+func tmuxWindowExistsByID(windowID string, windowName string) bool {
+	if windowID != "" {
+		// Check by ID directly
+		cmd := exec.Command(tmuxPath, "list-windows", "-a", "-F", "#{window_id}")
+		out, err := cmd.Output()
+		if err != nil {
+			return false
+		}
+		scanner := bufio.NewScanner(bytes.NewReader(out))
+		for scanner.Scan() {
+			if scanner.Text() == windowID {
+				return true
+			}
+		}
+		return false
+	}
+	// Fallback: search by name
+	cmd := exec.Command(tmuxPath, "list-windows", "-a", "-F", "#{window_name}")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		if scanner.Text() == windowName {
+			return true
+		}
+	}
+	return false
+}
+
+func createTmuxWindow(windowName string, workDir string, continueSession bool) (string, error) {
+	// Build the command to run inside the window
 	cccCmd := cccPath + " run"
 	if continueSession {
 		cccCmd += " -c"
 	}
 
-	// Create tmux session with a login shell (don't run command directly - it kills session on exit)
-	args := []string{"new-session", "-d", "-s", name, "-c", workDir}
-	cmd := exec.Command(tmuxPath, args...)
-	if err := cmd.Run(); err != nil {
-		return err
+	// Get an existing session or create one
+	sess, err := getTargetSession()
+	if err != nil {
+		return "", err
 	}
 
-	// Enable mouse mode for this session (allows scrolling)
-	exec.Command(tmuxPath, "set-option", "-t", name, "mouse", "on").Run()
+	// Create new window, -P -F prints the window ID
+	args := []string{"new-window", "-P", "-F", "#{window_id}", "-t", sess + ":", "-n", windowName, "-c", workDir}
+	cmd := exec.Command(tmuxPath, args...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	windowID := strings.TrimSpace(string(out))
 
-	// Send the command to the session via send-keys (preserves TTY properly)
+	// Send the command to the window via send-keys using window ID
 	time.Sleep(200 * time.Millisecond)
-	exec.Command(tmuxPath, "send-keys", "-t", name, cccCmd, "C-m").Run()
+	exec.Command(tmuxPath, "send-keys", "-t", windowID, cccCmd, "C-m").Run()
 
-	return nil
+	return windowID, nil
 }
 
 // runClaudeRaw runs claude directly (used inside tmux sessions)
@@ -96,10 +176,9 @@ func runClaudeRaw(continueSession bool) error {
 	}
 
 	// Clean stale Telegram flag from previous sessions.
-	// This ensures a locally started session doesn't inherit a flag
-	// left behind when a previous session's stop hook didn't fire.
-	if tmuxName, err := exec.Command(tmuxPath, "display-message", "-p", "#{session_name}").Output(); err == nil {
-		name := strings.TrimSpace(string(tmuxName))
+	// Use window_name to identify the session
+	if winName, err := exec.Command(tmuxPath, "display-message", "-p", "#{window_name}").Output(); err == nil {
+		name := strings.TrimSpace(string(winName))
 		if name != "" {
 			os.Remove(telegramActiveFlag(name))
 		}
@@ -126,10 +205,15 @@ func runClaudeRaw(continueSession bool) error {
 }
 
 // waitForClaude polls the tmux pane until Claude Code's input prompt appears
-func waitForClaude(session string, timeout time.Duration) error {
+func waitForClaude(target string, timeout time.Duration) error {
+	// Poll faster for short timeouts (message sending), slower for startup
+	interval := 100 * time.Millisecond
+	if timeout > 10*time.Second {
+		interval = 500 * time.Millisecond
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		cmd := exec.Command(tmuxPath, "capture-pane", "-t", session, "-p")
+		cmd := exec.Command(tmuxPath, "capture-pane", "-t", target, "-p")
 		out, err := cmd.Output()
 		if err == nil {
 			content := string(out)
@@ -138,24 +222,32 @@ func waitForClaude(session string, timeout time.Duration) error {
 				return nil
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(interval)
 	}
 	return fmt.Errorf("timeout waiting for Claude to start")
 }
 
 // sendToTmuxFromTelegram sets the Telegram active flag before sending,
 // so the permission hook knows this input came from Telegram and requires OTP.
-func sendToTmuxFromTelegram(session string, text string) error {
-	os.WriteFile(telegramActiveFlag(session), []byte("1"), 0600)
-	return sendToTmux(session, text)
+// windowNameFromTarget extracts the window name from a "session:window" target
+func windowNameFromTarget(target string) string {
+	if idx := strings.LastIndex(target, ":"); idx >= 0 {
+		return target[idx+1:]
+	}
+	return target
 }
 
-func sendToTmuxFromTelegramWithDelay(session string, text string, delay time.Duration) error {
-	os.WriteFile(telegramActiveFlag(session), []byte("1"), 0600)
-	return sendToTmuxWithDelay(session, text, delay)
+func sendToTmuxFromTelegram(target string, windowName string, text string) error {
+	os.WriteFile(telegramActiveFlag(windowName), []byte("1"), 0600)
+	return sendToTmux(target, text)
 }
 
-func sendToTmux(session string, text string) error {
+func sendToTmuxFromTelegramWithDelay(target string, windowName string, text string, delay time.Duration) error {
+	os.WriteFile(telegramActiveFlag(windowName), []byte("1"), 0600)
+	return sendToTmuxWithDelay(target, text, delay)
+}
+
+func sendToTmux(target string, text string) error {
 	// Calculate delay based on text length
 	// Base: 50ms + 0.5ms per character, capped at 5 seconds
 	baseDelay := 50 * time.Millisecond
@@ -164,69 +256,51 @@ func sendToTmux(session string, text string) error {
 	if delay > 5*time.Second {
 		delay = 5 * time.Second
 	}
-	return sendToTmuxWithDelay(session, text, delay)
+	return sendToTmuxWithDelay(target, text, delay)
 }
 
-func sendToTmuxWithDelay(session string, text string, delay time.Duration) error {
+func sendToTmuxWithDelay(target string, text string, delay time.Duration) error {
 	// Send text literally
-	cmd := exec.Command(tmuxPath, "send-keys", "-t", session, "-l", text)
+	cmd := exec.Command(tmuxPath, "send-keys", "-t", target, "-l", text)
 	if err := cmd.Run(); err != nil {
 		return err
 	}
 
-	// Wait for content to load (e.g., images)
-	time.Sleep(delay)
+	// Brief pause for TUI to process pasted text
+	time.Sleep(100 * time.Millisecond)
 
-	// Wait for "↵ send" indicator to appear (Claude Code is ready for Enter)
-	// Poll for up to 5 seconds
-	for i := 0; i < 50; i++ {
-		out, err := exec.Command(tmuxPath, "capture-pane", "-t", session, "-p", "-S", "-3").Output()
-		if err == nil && strings.Contains(string(out), "↵ send") {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	// Send Enter twice (Claude Code needs double Enter)
+	exec.Command(tmuxPath, "send-keys", "-t", target, "C-m").Run()
+	time.Sleep(50 * time.Millisecond)
+	exec.Command(tmuxPath, "send-keys", "-t", target, "C-m").Run()
 
-	// Try sending Enter up to 3 times, checking if it was processed
-	for attempt := 0; attempt < 3; attempt++ {
-		// Send Enter twice (Claude Code needs double Enter)
-		exec.Command(tmuxPath, "send-keys", "-t", session, "C-m").Run()
-		time.Sleep(50 * time.Millisecond)
-		exec.Command(tmuxPath, "send-keys", "-t", session, "C-m").Run()
-
-		// Wait a bit and check if "↵ send" is gone (meaning Enter was processed)
-		time.Sleep(300 * time.Millisecond)
-		out, err := exec.Command(tmuxPath, "capture-pane", "-t", session, "-p", "-S", "-3").Output()
-		if err != nil || !strings.Contains(string(out), "↵ send") {
-			// Either error or indicator gone - Enter was processed
-			return nil
-		}
-		hookLog("sendToTmux: attempt %d - Enter not processed, retrying", attempt+1)
-	}
-
-	hookLog("sendToTmux: Enter still not processed after 3 attempts")
 	return nil
 }
 
-func killTmuxSession(name string) error {
-	cmd := exec.Command(tmuxPath, "kill-session", "-t", name)
+func killTmuxWindow(windowID string, windowName string) error {
+	target := tmuxTargetByID(windowID, windowName)
+	cmd := exec.Command(tmuxPath, "kill-window", "-t", target)
 	return cmd.Run()
 }
 
-func listTmuxSessions() ([]string, error) {
-	cmd := exec.Command(tmuxPath, "list-sessions", "-F", "#{session_name}")
+func listTmuxWindows() ([]string, error) {
+	cmd := exec.Command(tmuxPath, "list-windows", "-a", "-F", "#{window_name}")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
 
-	var sessions []string
+	var windows []string
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
 		name := scanner.Text()
-		if strings.HasPrefix(name, "claude-") {
-			sessions = append(sessions, strings.TrimPrefix(name, "claude-"))
-		}
+		windows = append(windows, name)
 	}
-	return sessions, nil
+	return windows, nil
+}
+
+// killTmuxSession kills an entire tmux session (used for temporary sessions like auth)
+func killTmuxSession(name string) error {
+	cmd := exec.Command(tmuxPath, "kill-session", "-t", name)
+	return cmd.Run()
 }

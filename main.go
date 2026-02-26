@@ -7,13 +7,14 @@ import (
 	"strings"
 )
 
-const version = "1.6.2"
+const version = "1.7.0"
 
 // SessionInfo stores information about a session
 type SessionInfo struct {
 	TopicID         int64  `json:"topic_id"`
 	Path            string `json:"path"`
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
+	WindowID        string `json:"window_id,omitempty"` // tmux window ID (@N)
 }
 
 // Config stores bot configuration and session mappings
@@ -130,8 +131,13 @@ type HookToolInput struct {
 		} `json:"options"`
 	} `json:"questions"`
 	Command     string `json:"command,omitempty"`     // For Bash
-	Description string `json:"description,omitempty"` // For Bash
+	Description string `json:"description,omitempty"` // For Bash/Task
 	FilePath    string `json:"file_path,omitempty"`   // For Read/Write/Edit
+	Query       string `json:"query,omitempty"`       // For WebSearch
+	Pattern     string `json:"pattern,omitempty"`     // For Grep/Glob
+	URL         string `json:"url,omitempty"`         // For WebFetch
+	Prompt      string `json:"prompt,omitempty"`      // For Task/WebFetch
+	OldString   string `json:"old_string,omitempty"`  // For Edit
 }
 
 // parseHookData unmarshals raw JSON and populates ToolInput
@@ -342,6 +348,28 @@ func main() {
 
 	case "hook-stop":
 		if err := handleStopHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-stop-retry":
+		// Background process: retry transcript read 3x at 2s intervals
+		// Args: sessName topicID transcriptPath
+		if len(os.Args) < 5 {
+			os.Exit(1)
+		}
+		var tid int64
+		fmt.Sscan(os.Args[3], &tid)
+		handleStopRetry(os.Args[2], tid, os.Args[4])
+
+	case "hook-post-tool":
+		if err := handlePostToolHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-user-prompt":
+		if err := handleUserPromptHook(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
