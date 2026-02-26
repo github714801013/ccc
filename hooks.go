@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -367,17 +367,35 @@ func extractRecentAssistantTexts(transcriptPath string, tailCount int) []assista
 		Text string `json:"text"`
 	}
 
-	// Collect assistant entries from the tail
+	// Read only the tail of the file (last 512KB) to avoid scanning the entire transcript
+	const tailBytes = 512 * 1024
+	fi, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	offset := int64(0)
+	if fi.Size() > tailBytes {
+		offset = fi.Size() - tailBytes
+		f.Seek(offset, 0)
+	}
+	tailData, err := io.ReadAll(f)
+	if err != nil {
+		return nil
+	}
+	// If we seeked into the middle of a line, skip the first partial line
+	if offset > 0 {
+		if idx := bytes.IndexByte(tailData, '\n'); idx >= 0 {
+			tailData = tailData[idx+1:]
+		}
+	}
+
 	type entry struct {
 		requestID string
 		content   json.RawMessage
 	}
 
 	var entries []entry
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	for _, line := range bytes.Split(tailData, []byte("\n")) {
 		if len(line) == 0 {
 			continue
 		}

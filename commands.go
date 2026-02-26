@@ -1334,22 +1334,11 @@ func listen() error {
 						TelegramDelivered: true,
 					})
 
-					clearPromptAck(sessName)
 					if err := sendToTmuxFromTelegram(target, tmuxName, text); err != nil {
 						listenLog("sendToTmux FAILED: target=%s err=%v", target, err)
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
-					} else if waitPromptAck(sessName, 1*time.Second) {
-						updateDelivery(sessName, ledgerID, "terminal_delivered", true)
 					} else {
-						// Retry once
-						listenLog("sendToTmux: no ack, retrying target=%s", target)
-						clearPromptAck(sessName)
-						sendToTmuxFromTelegram(target, tmuxName, text)
-						if waitPromptAck(sessName, 1*time.Second) {
-							updateDelivery(sessName, ledgerID, "terminal_delivered", true)
-						} else {
-							listenLog("sendToTmux: retry failed, no ack target=%s", target)
-						}
+						updateDelivery(sessName, ledgerID, "terminal_delivered", true)
 					}
 				} else {
 					sendMessage(config, chatID, threadID, "⚠️ No session linked to this topic. Use /new <name> to create one.")

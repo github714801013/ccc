@@ -187,7 +187,20 @@ func sendMessageWithMode(config *Config, chatID int64, threadID int64, text stri
 			return 0, err
 		}
 		if !result.OK {
-			return 0, fmt.Errorf("telegram error: %s", result.Description)
+			// If Markdown/HTML parsing fails, retry as plain text
+			if strings.Contains(result.Description, "parse entities") && parseMode != "" {
+				params.Del("parse_mode")
+				params.Set("text", "⚠️\n[this message displayed as plain text, since markdown parse failed]\n\n"+msg)
+				result, err = telegramAPI(config, "sendMessage", params)
+				if err != nil {
+					return 0, err
+				}
+				if !result.OK {
+					return 0, fmt.Errorf("telegram error: %s", result.Description)
+				}
+			} else {
+				return 0, fmt.Errorf("telegram error: %s", result.Description)
+			}
 		}
 
 		// Extract message_id from result
