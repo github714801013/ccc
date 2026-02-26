@@ -1100,7 +1100,8 @@ func listen() error {
 
 				// /new <name> - create brand new session + topic
 				if arg != "" {
-					if _, exists := config.Sessions[arg]; exists {
+					existing, exists := config.Sessions[arg]
+					if exists && existing != nil && existing.TopicID != 0 {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session '%s' already exists. Use /new without args in that topic to restart.", arg))
 						continue
 					}
@@ -1109,7 +1110,11 @@ func listen() error {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to create topic: %v", err))
 						continue
 					}
+					// Use pre-configured path if session was preset, otherwise resolve from name
 					workDir := resolveProjectPath(config, arg)
+					if exists && existing != nil && existing.Path != "" {
+						workDir = existing.Path
+					}
 					config.Sessions[arg] = &SessionInfo{
 						TopicID: topicID,
 						Path:    workDir,

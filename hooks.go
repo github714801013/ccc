@@ -34,8 +34,24 @@ func readHookStdin() ([]byte, error) {
 	}
 }
 
-// findSession matches a hook's cwd to a configured session
-func findSession(config *Config, cwd string) (string, int64) {
+// findSessionByClaudeID matches a claude session ID to a configured session
+func findSessionByClaudeID(config *Config, claudeSessionID string) (string, int64) {
+	if claudeSessionID == "" {
+		return "", 0
+	}
+	for name, info := range config.Sessions {
+		if name == "" || info == nil {
+			continue
+		}
+		if info.ClaudeSessionID == claudeSessionID {
+			return name, info.TopicID
+		}
+	}
+	return "", 0
+}
+
+// findSessionByCwd matches a hook's cwd to a configured session (fallback)
+func findSessionByCwd(config *Config, cwd string) (string, int64) {
 	for name, info := range config.Sessions {
 		if name == "" || info == nil {
 			continue
@@ -45,6 +61,30 @@ func findSession(config *Config, cwd string) (string, int64) {
 		}
 	}
 	return "", 0
+}
+
+// findSession matches by claude_session_id first, then falls back to cwd
+func findSession(config *Config, cwd string, claudeSessionID string) (string, int64) {
+	if name, topicID := findSessionByClaudeID(config, claudeSessionID); name != "" {
+		return name, topicID
+	}
+	return findSessionByCwd(config, cwd)
+}
+
+// persistClaudeSessionID saves the claude session ID to config if changed
+func persistClaudeSessionID(config *Config, sessName string, claudeSessionID string) {
+	if claudeSessionID == "" || sessName == "" {
+		return
+	}
+	info, exists := config.Sessions[sessName]
+	if !exists || info == nil {
+		return
+	}
+	if info.ClaudeSessionID != claudeSessionID {
+		info.ClaudeSessionID = claudeSessionID
+		saveConfig(config)
+		hookLog("persisted claude_session_id=%s for session=%s", claudeSessionID, sessName)
+	}
 }
 
 func handleStopHook() error {
@@ -65,28 +105,41 @@ func handleStopHook() error {
 		return nil
 	}
 
-	sessName, topicID := findSession(config, hookData.Cwd)
+	sessName, topicID := findSession(config, hookData.Cwd, hookData.SessionID)
 	if sessName == "" || config.GroupID == 0 || topicID == 0 {
 		return nil
 	}
 
-	hookLog("stop-hook: session=%s transcript=%s", sessName, hookData.TranscriptPath)
+	// Persist claude session ID to config for future lookups
+	persistClaudeSessionID(config, sessName, hookData.SessionID)
+
+	hookLog("stop-hook: session=%s claude_session_id=%s transcript=%s", sessName, hookData.SessionID, hookData.TranscriptPath)
 
 	// Clear Telegram active flag when Claude stops
 	tmuxName := "claude-" + strings.ReplaceAll(sessName, ".", "_")
 	os.Remove(telegramActiveFlag(tmuxName))
 
-	blocks := extractLastTurn(hookData.TranscriptPath)
+	// Retry extractLastTurn a few times - transcript may not be fully flushed yet
+	var blocks []string
+	for attempt := 0; attempt < 5; attempt++ {
+		blocks = extractLastTurn(hookData.TranscriptPath)
+		if len(blocks) > 0 {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	hookLog("stop-hook: extractLastTurn returned %d blocks", len(blocks))
 	if len(blocks) == 0 {
 		// No text blocks found, just send completion marker
-		sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s", sessName))
+		sendMessage(config, config.GroupID, topicID, fmt.Sprintf("*%s:* ✅", sessName))
 		return nil
 	}
 
 	for i, block := range blocks {
+		hookLog("stop-hook: block[%d] len=%d preview=%s", i, len(block), truncate(block, 80))
 		text := block
 		if i == len(blocks)-1 {
-			text = fmt.Sprintf("✅ %s\n\n%s", sessName, block)
+			text = fmt.Sprintf("*%s:*\n%s", sessName, block)
 		}
 		sendMessageGetID(config, config.GroupID, topicID, text)
 	}
@@ -277,10 +330,13 @@ func handlePermissionHook() error {
 		return nil
 	}
 
-	sessName, topicID := findSession(config, hookData.Cwd)
+	sessName, topicID := findSession(config, hookData.Cwd, hookData.SessionID)
 	if sessName == "" || config.GroupID == 0 {
 		return nil
 	}
+
+	// Persist claude session ID to config for future lookups
+	persistClaudeSessionID(config, sessName, hookData.SessionID)
 
 	// Handle AskUserQuestion - forward to Telegram with buttons
 	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {

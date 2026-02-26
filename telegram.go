@@ -165,8 +165,9 @@ func sendMessageGetID(config *Config, chatID int64, threadID int64, text string)
 
 	for _, msg := range messages {
 		params := url.Values{
-			"chat_id": {fmt.Sprintf("%d", chatID)},
-			"text":    {msg},
+			"chat_id":    {fmt.Sprintf("%d", chatID)},
+			"text":       {msg},
+			"parse_mode": {"Markdown"},
 		}
 		if threadID > 0 {
 			params.Set("message_thread_id", fmt.Sprintf("%d", threadID))
