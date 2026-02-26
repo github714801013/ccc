@@ -294,28 +294,29 @@ func handleStopHook() error {
 	collapseToolMessage(config, sessName, topicID)
 	clearToolState(sessName)
 
-	// Extract recent assistant text blocks from transcript tail (last 80 entries
-	// gives overlap with previous stop hook scans; ledger dedup prevents resending)
-	blocks := extractRecentAssistantTexts(hookData.TranscriptPath, 80)
-	hookLog("stop-hook: extracted %d text blocks from tail", len(blocks))
+	deliverUnsentTexts(config, sessName, topicID, hookData.TranscriptPath)
 
+	return nil
+}
+
+// deliverUnsentTexts scans transcript tail and sends any assistant text
+// blocks not yet delivered to Telegram (using ledger dedup).
+func deliverUnsentTexts(config *Config, sessName string, topicID int64, transcriptPath string) int {
+	blocks := extractRecentAssistantTexts(transcriptPath, 80)
 	sent := 0
 	for _, block := range blocks {
 		blockID := fmt.Sprintf("reply:%s:%s", block.requestID, contentHash(block.text))
-
 		if isDelivered(sessName, blockID, "telegram") {
 			continue
 		}
-
-		hookLog("stop-hook: sending rid=%s len=%d preview=%s", block.requestID, len(block.text), truncate(block.text, 80))
+		hookLog("deliver-text: rid=%s len=%d preview=%s", block.requestID, len(block.text), truncate(block.text, 80))
 		msg := fmt.Sprintf("*%s:*\n%s", sessName, block.text)
 		tgMsgID, err := sendMessageGetID(config, config.GroupID, topicID, msg)
 		if err != nil {
-			hookLog("stop-hook: send failed, retrying: %v", err)
+			hookLog("deliver-text: send failed, retrying: %v", err)
 			time.Sleep(500 * time.Millisecond)
 			tgMsgID, _ = sendMessageGetID(config, config.GroupID, topicID, msg)
 		}
-
 		appendMessage(&MessageRecord{
 			ID:                blockID,
 			Session:           sessName,
@@ -328,12 +329,7 @@ func handleStopHook() error {
 		})
 		sent++
 	}
-
-	if sent == 0 && len(blocks) == 0 {
-		sendMessage(config, config.GroupID, topicID, fmt.Sprintf("*%s:* ✅", sessName))
-	}
-
-	return nil
+	return sent
 }
 
 // assistantTextBlock pairs extracted text with its requestId for dedup
@@ -477,8 +473,12 @@ func handlePermissionHook() error {
 	// Persist claude session ID to config for future lookups
 	persistClaudeSessionID(config, sessName, hookData.SessionID)
 
+	// Deliver any unsent assistant text before showing tool calls
+	if topicID != 0 && hookData.TranscriptPath != "" {
+		deliverUnsentTexts(config, sessName, topicID, hookData.TranscriptPath)
+	}
+
 	// Update tool call display
-	// Must run synchronously - if we use a goroutine the process exits before it completes
 	if hookData.ToolName != "" && hookData.ToolName != "AskUserQuestion" && topicID != 0 {
 		state := loadToolState(sessName)
 		state.Tools = append(state.Tools, ToolCall{
