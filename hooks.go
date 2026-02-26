@@ -406,10 +406,13 @@ func handleStopHook() error {
 	clearThinking(sessName)
 
 	// Collapse tool message from this turn, interleaving any text blocks
+	hookLog("stop-hook: collapsing tool message")
 	interleavedTexts := collapseToolMessage(config, sessName, topicID, hookData.TranscriptPath)
 	clearToolState(sessName)
+	hookLog("stop-hook: delivering unsent texts, skipTexts=%d", len(interleavedTexts))
 
-	deliverUnsentTexts(config, sessName, topicID, hookData.TranscriptPath, interleavedTexts)
+	sent := deliverUnsentTexts(config, sessName, topicID, hookData.TranscriptPath, interleavedTexts)
+	hookLog("stop-hook: done, sent=%d", sent)
 
 	return nil
 }
@@ -419,6 +422,11 @@ func handleStopHook() error {
 // skipTexts contains text prefixes already interleaved into the tool message.
 func deliverUnsentTexts(config *Config, sessName string, topicID int64, transcriptPath string, skipTexts []string) int {
 	blocks := extractRecentAssistantTexts(transcriptPath, 80)
+	lastPreview := ""
+	if len(blocks) > 0 {
+		lastPreview = truncate(blocks[len(blocks)-1].text, 60)
+	}
+	hookLog("deliver-unsent: found %d blocks, last=%s", len(blocks), lastPreview)
 	sent := 0
 	for _, block := range blocks {
 		blockID := fmt.Sprintf("reply:%s:%s", block.requestID, contentHash(block.text))
