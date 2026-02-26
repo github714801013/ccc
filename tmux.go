@@ -85,27 +85,47 @@ func getTargetSession() (string, error) {
 	return defaultTmuxSession, nil
 }
 
-// tmuxTarget returns the tmux target for a window: "<session>:<name>"
-func tmuxTarget(windowName string) string {
-	// Find which session contains this window
-	cmd := exec.Command(tmuxPath, "list-windows", "-a", "-F", "#{session_name}:#{window_name}")
+// tmuxTargetByID returns the window ID if available, otherwise falls back to name lookup
+func tmuxTargetByID(windowID string, windowName string) string {
+	if windowID != "" {
+		return windowID
+	}
+	return tmuxTargetByName(windowName)
+}
+
+// tmuxTargetByName finds a window target by name (fallback)
+func tmuxTargetByName(windowName string) string {
+	cmd := exec.Command(tmuxPath, "list-windows", "-a", "-F", "#{window_id}\t#{window_name}")
 	out, err := cmd.Output()
 	if err == nil {
-		suffix := ":" + windowName
 		scanner := bufio.NewScanner(bytes.NewReader(out))
 		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasSuffix(line, suffix) {
-				return line
+			parts := strings.SplitN(scanner.Text(), "\t", 2)
+			if len(parts) == 2 && parts[1] == windowName {
+				return parts[0] // return window ID
 			}
 		}
 	}
-	// Fallback: assume default session
 	return defaultTmuxSession + ":" + windowName
 }
 
-func tmuxWindowExists(windowName string) bool {
-	// Search across all sessions
+func tmuxWindowExistsByID(windowID string, windowName string) bool {
+	if windowID != "" {
+		// Check by ID directly
+		cmd := exec.Command(tmuxPath, "list-windows", "-a", "-F", "#{window_id}")
+		out, err := cmd.Output()
+		if err != nil {
+			return false
+		}
+		scanner := bufio.NewScanner(bytes.NewReader(out))
+		for scanner.Scan() {
+			if scanner.Text() == windowID {
+				return true
+			}
+		}
+		return false
+	}
+	// Fallback: search by name
 	cmd := exec.Command(tmuxPath, "list-windows", "-a", "-F", "#{window_name}")
 	out, err := cmd.Output()
 	if err != nil {
@@ -120,7 +140,7 @@ func tmuxWindowExists(windowName string) bool {
 	return false
 }
 
-func createTmuxWindow(windowName string, workDir string, continueSession bool) error {
+func createTmuxWindow(windowName string, workDir string, continueSession bool) (string, error) {
 	// Build the command to run inside the window
 	cccCmd := cccPath + " run"
 	if continueSession {
@@ -130,21 +150,23 @@ func createTmuxWindow(windowName string, workDir string, continueSession bool) e
 	// Get an existing session or create one
 	sess, err := getTargetSession()
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	// Create new window in the session
-	args := []string{"new-window", "-t", sess, "-n", windowName, "-c", workDir}
+	// Create new window, -P -F prints the window ID
+	args := []string{"new-window", "-P", "-F", "#{window_id}", "-t", sess + ":", "-n", windowName, "-c", workDir}
 	cmd := exec.Command(tmuxPath, args...)
-	if err := cmd.Run(); err != nil {
-		return err
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
 	}
+	windowID := strings.TrimSpace(string(out))
 
-	// Send the command to the window via send-keys (preserves TTY properly)
+	// Send the command to the window via send-keys using window ID
 	time.Sleep(200 * time.Millisecond)
-	exec.Command(tmuxPath, "send-keys", "-t", tmuxTarget(windowName), cccCmd, "C-m").Run()
+	exec.Command(tmuxPath, "send-keys", "-t", windowID, cccCmd, "C-m").Run()
 
-	return nil
+	return windowID, nil
 }
 
 // runClaudeRaw runs claude directly (used inside tmux sessions)
@@ -250,8 +272,8 @@ func sendToTmuxWithDelay(target string, text string, delay time.Duration) error 
 	return nil
 }
 
-func killTmuxWindow(windowName string) error {
-	target := tmuxTarget(windowName)
+func killTmuxWindow(windowID string, windowName string) error {
+	target := tmuxTargetByID(windowID, windowName)
 	cmd := exec.Command(tmuxPath, "kill-window", "-t", target)
 	return cmd.Run()
 }

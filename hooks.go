@@ -101,7 +101,7 @@ func formatToolLines(state *ToolState) string {
 	return strings.Join(lines, "\n")
 }
 
-// formatToolMessage builds expanded blockquote (during tool calls)
+// formatToolMessage builds blockquote (expanded during tool calls)
 func formatToolMessage(state *ToolState) string {
 	return "<blockquote>" + formatToolLines(state) + "</blockquote>"
 }
@@ -297,10 +297,29 @@ func handleStopHook() error {
 		return nil
 	}
 
-	// Send only the last block as the response
-	lastBlock := blocks[len(blocks)-1]
-	hookLog("stop-hook: sending final block len=%d preview=%s", len(lastBlock), truncate(lastBlock, 80))
-	sendMessageGetID(config, config.GroupID, topicID, fmt.Sprintf("*%s:*\n%s", sessName, lastBlock))
+	// Send all blocks, with dedup check per block
+	for i, block := range blocks {
+		blockID := fmt.Sprintf("reply:%s:%s", hookData.SessionID, contentHash(block))
+
+		if isDelivered(sessName, blockID, "telegram") {
+			hookLog("stop-hook: block %d/%d already delivered, skipping (id=%s)", i+1, len(blocks), blockID)
+			continue
+		}
+
+		hookLog("stop-hook: sending block %d/%d len=%d preview=%s", i+1, len(blocks), len(block), truncate(block, 80))
+		tgMsgID, _ := sendMessageGetID(config, config.GroupID, topicID, fmt.Sprintf("*%s:*\n%s", sessName, block))
+
+		appendMessage(&MessageRecord{
+			ID:                blockID,
+			Session:           sessName,
+			Type:              "assistant_text",
+			Text:              truncate(block, 500),
+			Origin:            "claude",
+			TerminalDelivered: true,
+			TelegramDelivered: tgMsgID > 0,
+			TelegramMsgID:     tgMsgID,
+		})
+	}
 
 	return nil
 }
@@ -520,6 +539,18 @@ func handlePermissionHook() error {
 			editMessageHTML(config, config.GroupID, state.MsgID, topicID, text)
 		}
 		saveToolState(sessName, state)
+
+		// Record tool call in ledger
+		appendMessage(&MessageRecord{
+			ID:                fmt.Sprintf("tool:%s:%s:%d", hookData.SessionID, contentHash(hookData.ToolName+toolInputSummary(hookData)), time.Now().UnixNano()),
+			Session:           sessName,
+			Type:              "tool_call",
+			Text:              hookData.ToolName + ": " + toolInputSummary(hookData),
+			Origin:            "claude",
+			TerminalDelivered: true,
+			TelegramDelivered: state.MsgID != 0,
+			TelegramMsgID:     state.MsgID,
+		})
 	}
 
 	// Handle AskUserQuestion - forward to Telegram with buttons
@@ -696,12 +727,36 @@ func handleUserPromptHook() error {
 		if time.Since(flagInfo.ModTime()) < 30*time.Second {
 			os.Remove(telegramActiveFlag(tmuxName))
 			setThinking(sessName)
+			// Record: came from Telegram, both sides have it
+			appendMessage(&MessageRecord{
+				ID:                fmt.Sprintf("prompt:%s:%d", hookData.SessionID, time.Now().UnixNano()),
+				Session:           sessName,
+				Type:              "user_prompt",
+				Text:              hookData.Prompt,
+				Origin:            "telegram",
+				TerminalDelivered: true,
+				TelegramDelivered: true,
+			})
 			return nil
 		}
 	}
 
 	setThinking(sessName)
+
+	// Record: came from terminal, Telegram not yet delivered
+	msgID := fmt.Sprintf("prompt:%s:%d", hookData.SessionID, time.Now().UnixNano())
+	appendMessage(&MessageRecord{
+		ID:                msgID,
+		Session:           sessName,
+		Type:              "user_prompt",
+		Text:              hookData.Prompt,
+		Origin:            "terminal",
+		TerminalDelivered: true,
+		TelegramDelivered: false,
+	})
+
 	sendMessage(config, config.GroupID, topicID, fmt.Sprintf("💬 %s", hookData.Prompt))
+	updateDelivery(sessName, msgID, "telegram_delivered", true)
 	return nil
 }
 
@@ -752,7 +807,18 @@ func handleNotificationHook() error {
 	}
 
 	if msg != "" {
+		msgID := fmt.Sprintf("notif:%s:%d", hookData.SessionID, time.Now().UnixNano())
+		appendMessage(&MessageRecord{
+			ID:                msgID,
+			Session:           sessName,
+			Type:              "notification",
+			Text:              msg,
+			Origin:            "claude",
+			TerminalDelivered: true,
+			TelegramDelivered: false,
+		})
 		sendMessage(config, config.GroupID, topicID, msg)
+		updateDelivery(sessName, msgID, "telegram_delivered", true)
 	}
 
 	return nil

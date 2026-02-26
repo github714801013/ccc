@@ -15,6 +15,19 @@ func tmuxSafeName(name string) string {
 	return strings.ReplaceAll(name, ".", "_")
 }
 
+// getWindowID safely looks up the tmux WindowID from config for a session name.
+// Returns empty string if the session or WindowID is not set.
+func getWindowID(config *Config, sessionName string) string {
+	if config == nil || config.Sessions == nil {
+		return ""
+	}
+	info, exists := config.Sessions[sessionName]
+	if !exists || info == nil {
+		return ""
+	}
+	return info.WindowID
+}
+
 func createSession(config *Config, name string) error {
 	// Check if session already exists
 	if _, exists := config.Sessions[name]; exists {
@@ -34,14 +47,16 @@ func createSession(config *Config, name string) error {
 		os.MkdirAll(workDir, 0755)
 	}
 
-	if err := createTmuxWindow(tmuxSafeName(name), workDir, false); err != nil {
+	windowID, err := createTmuxWindow(tmuxSafeName(name), workDir, false)
+	if err != nil {
 		return fmt.Errorf("failed to create tmux window: %w", err)
 	}
 
 	// Save mapping with full path
 	config.Sessions[name] = &SessionInfo{
-		TopicID: topicID,
-		Path:    workDir,
+		TopicID:  topicID,
+		Path:     workDir,
+		WindowID: windowID,
 	}
 	if err := saveConfig(config); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
@@ -56,7 +71,7 @@ func killSession(config *Config, name string) error {
 	}
 
 	// Kill tmux window
-	killTmuxWindow(tmuxSafeName(name))
+	killTmuxWindow(getWindowID(config, name), tmuxSafeName(name))
 
 	// Remove from config
 	delete(config.Sessions, name)
@@ -107,9 +122,10 @@ func startSession(continueSession bool) error {
 	}
 
 	// Check if window already exists
-	if tmuxWindowExists(winName) {
-		target := tmuxTarget(winName)
-		// Extract session name from target "session:window"
+	windowID := getWindowID(config, name)
+	if tmuxWindowExistsByID(windowID, winName) {
+		target := tmuxTargetByID(windowID, winName)
+		// Extract session name from target "session:window" (only for name-based targets)
 		sessName := strings.SplitN(target, ":", 2)[0]
 		if os.Getenv("TMUX") != "" {
 			cmd := exec.Command(tmuxPath, "select-window", "-t", target)
@@ -127,11 +143,18 @@ func startSession(continueSession bool) error {
 	}
 
 	// Create new window
-	if err := createTmuxWindow(winName, cwd, continueSession); err != nil {
+	windowID, err = createTmuxWindow(winName, cwd, continueSession)
+	if err != nil {
 		return err
 	}
 
-	target := tmuxTarget(winName)
+	// Store window ID back to config
+	if config.Sessions[name] != nil {
+		config.Sessions[name].WindowID = windowID
+		saveConfig(config)
+	}
+
+	target := tmuxTargetByID(windowID, winName)
 	sessName := strings.SplitN(target, ":", 2)[0]
 	if os.Getenv("TMUX") != "" {
 		cmd := exec.Command(tmuxPath, "select-window", "-t", target)
@@ -167,26 +190,29 @@ func startDetached(name string, workDir string, prompt string) error {
 	winName := tmuxSafeName(name)
 
 	// Kill existing window if any
-	if tmuxWindowExists(winName) {
-		killTmuxWindow(winName)
+	oldWindowID := getWindowID(config, name)
+	if tmuxWindowExistsByID(oldWindowID, winName) {
+		killTmuxWindow(oldWindowID, winName)
 		time.Sleep(300 * time.Millisecond)
 	}
 
 	// Create tmux window (detached)
-	if err := createTmuxWindow(winName, workDir, false); err != nil {
+	windowID, err := createTmuxWindow(winName, workDir, false)
+	if err != nil {
 		return fmt.Errorf("failed to create tmux window: %w", err)
 	}
 
 	// Save session info
 	config.Sessions[name] = &SessionInfo{
-		TopicID: topicID,
-		Path:    workDir,
+		TopicID:  topicID,
+		Path:     workDir,
+		WindowID: windowID,
 	}
 	if err := saveConfig(config); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
-	target := tmuxTarget(winName)
+	target := tmuxTargetByID(windowID, winName)
 
 	// Wait for Claude to be ready before sending prompt
 	if err := waitForClaude(target, 30*time.Second); err != nil {

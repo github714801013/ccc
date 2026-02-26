@@ -14,6 +14,7 @@ type SessionInfo struct {
 	TopicID         int64  `json:"topic_id"`
 	Path            string `json:"path"`
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
+	WindowID        string `json:"window_id,omitempty"` // tmux window ID (@N)
 }
 
 // Config stores bot configuration and session mappings
