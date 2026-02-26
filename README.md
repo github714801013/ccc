@@ -557,6 +557,51 @@ This checks tmux, claude, config, hooks, and service status.
 - Verify Claude can start: `claude --version`
 - Check tmux windows: `tmux list-windows -a`
 
+## Claude Code Transcript Format
+
+ccc reads Claude Code's JSONL transcript files to extract assistant responses. Each line is a JSON object.
+
+### Entry Types
+
+| type | role | requestId | description |
+|------|------|-----------|-------------|
+| `assistant` | `assistant` | `req_...` | Claude's response (text, tool_use, thinking) |
+| `user` | `user` | _(none)_ | User input |
+| `progress` | _(none)_ | _(none)_ | Internal progress events |
+| `system` | _(none)_ | _(none)_ | System messages |
+| `file-history-snapshot` | _(none)_ | _(none)_ | File state snapshots |
+
+### Assistant Entry Structure
+
+```jsonc
+{
+  "type": "assistant",
+  "requestId": "req_011CYWEqXoTKAJ965XkX2Zg8",  // unique per API request
+  "uuid": "4c512583-...",                          // unique per entry
+  "parentUuid": "aa4af00b-...",
+  "timestamp": "2026-02-26T06:53:01.147Z",
+  "sessionId": "49cc5f89-...",
+  "message": {
+    "role": "assistant",
+    "content": [                                    // array of content blocks
+      { "type": "text", "text": "..." },           // text response
+      { "type": "tool_use", "name": "Bash", ... }, // tool call
+      { "type": "thinking", "thinking": "..." }    // thinking block
+    ]
+  }
+  // "isApiErrorMessage": true  — present on error entries (no requestId)
+}
+```
+
+### Key Facts
+
+- **Format**: Always nested (`message.role`, `message.content`), no flat format observed
+- **Ordering**: File order = chronological (sub-millisecond jitter only)
+- **requestId**: Present on all assistant entries except `isApiErrorMessage=true` errors
+- **Same requestId**: Multiple entries can share a requestId (one request → thinking + tool_use + text)
+- **User content**: Can be `string` or `list` (two formats coexist)
+- **Error entries**: `isApiErrorMessage=true`, no requestId, text like "No response requested" — should be skipped
+
 ## Contributing
 
 Contributions welcome! Please:

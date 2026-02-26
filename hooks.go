@@ -263,70 +263,56 @@ func handleStopHook() error {
 	os.Remove(telegramActiveFlag(tmuxName))
 	clearThinking(sessName)
 
-	// Retry extractLastTurn a few times - transcript may not be fully flushed yet
-	var blocks []string
-	for attempt := 0; attempt < 5; attempt++ {
-		blocks = extractLastTurn(hookData.TranscriptPath)
-		if len(blocks) > 0 {
-			break
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	hookLog("stop-hook: extractLastTurn returned %d blocks", len(blocks))
-
-	// Append intermediate text blocks (all but last) to the tool call message,
-	// then collapse it. Only the final block is sent as the response.
-	state := loadToolState(sessName)
-	if state.MsgID != 0 && len(blocks) > 1 {
-		// Prepend intermediate text blocks above tool calls
-		var extra []ToolCall
-		for _, b := range blocks[:len(blocks)-1] {
-			extra = append(extra, ToolCall{Input: truncate(b, 200)})
-		}
-		state.Tools = append(extra, state.Tools...)
-		text := formatToolMessageCollapsed(state)
-		editMessageHTML(config, config.GroupID, state.MsgID, topicID, text)
-	} else {
-		collapseToolMessage(config, sessName, topicID)
-	}
+	// Collapse tool message from this turn
+	collapseToolMessage(config, sessName, topicID)
 	clearToolState(sessName)
 
-	if len(blocks) == 0 {
-		// No text blocks found, just send completion marker
-		sendMessage(config, config.GroupID, topicID, fmt.Sprintf("*%s:* ✅", sessName))
-		return nil
-	}
+	// Extract recent assistant text blocks from transcript tail (last 80 entries
+	// gives overlap with previous stop hook scans; ledger dedup prevents resending)
+	blocks := extractRecentAssistantTexts(hookData.TranscriptPath, 80)
+	hookLog("stop-hook: extracted %d text blocks from tail", len(blocks))
 
-	// Send all blocks, with dedup check per block
-	for i, block := range blocks {
-		blockID := fmt.Sprintf("reply:%s:%s", hookData.SessionID, contentHash(block))
+	sent := 0
+	for _, block := range blocks {
+		blockID := fmt.Sprintf("reply:%s:%s", block.requestID, contentHash(block.text))
 
 		if isDelivered(sessName, blockID, "telegram") {
-			hookLog("stop-hook: block %d/%d already delivered, skipping (id=%s)", i+1, len(blocks), blockID)
 			continue
 		}
 
-		hookLog("stop-hook: sending block %d/%d len=%d preview=%s", i+1, len(blocks), len(block), truncate(block, 80))
-		tgMsgID, _ := sendMessageGetID(config, config.GroupID, topicID, fmt.Sprintf("*%s:*\n%s", sessName, block))
+		hookLog("stop-hook: sending rid=%s len=%d preview=%s", block.requestID, len(block.text), truncate(block.text, 80))
+		tgMsgID, _ := sendMessageGetID(config, config.GroupID, topicID, fmt.Sprintf("*%s:*\n%s", sessName, block.text))
 
 		appendMessage(&MessageRecord{
 			ID:                blockID,
 			Session:           sessName,
 			Type:              "assistant_text",
-			Text:              truncate(block, 500),
+			Text:              truncate(block.text, 500),
 			Origin:            "claude",
 			TerminalDelivered: true,
 			TelegramDelivered: tgMsgID > 0,
 			TelegramMsgID:     tgMsgID,
 		})
+		sent++
+	}
+
+	if sent == 0 && len(blocks) == 0 {
+		sendMessage(config, config.GroupID, topicID, fmt.Sprintf("*%s:* ✅", sessName))
 	}
 
 	return nil
 }
 
-// extractLastTurn reads the JSONL transcript and extracts text blocks from
-// the last assistant turn (after the last real user message).
-func extractLastTurn(transcriptPath string) []string {
+// assistantTextBlock pairs extracted text with its requestId for dedup
+type assistantTextBlock struct {
+	requestID string
+	text      string
+}
+
+// extractRecentAssistantTexts reads the last N assistant entries from the
+// transcript and returns their text blocks. The caller uses ledger dedup
+// to avoid resending previously delivered messages.
+func extractRecentAssistantTexts(transcriptPath string, tailCount int) []assistantTextBlock {
 	if transcriptPath == "" {
 		return nil
 	}
@@ -337,37 +323,30 @@ func extractLastTurn(transcriptPath string) []string {
 	}
 	defer f.Close()
 
-	type contentBlock struct {
-		Type    string `json:"type"`
-		Text    string `json:"text"`
-		Name    string `json:"name,omitempty"`
-		Content string `json:"content,omitempty"`
-	}
-
-	// transcriptLine handles both nested (message.content) and flat (root-level
-	// content) JSONL formats. Claude Code v2.1.45+ may emit either.
 	type transcriptLine struct {
-		Type      string          `json:"type"`
-		RequestID string          `json:"requestId,omitempty"`
-		Role      string          `json:"role,omitempty"`
-		Content   json.RawMessage `json:"content,omitempty"`
-		Message   struct {
+		Type             string `json:"type"`
+		RequestID        string `json:"requestId,omitempty"`
+		IsApiErrorMessage bool  `json:"isApiErrorMessage,omitempty"`
+		Message          struct {
 			Role    string          `json:"role"`
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
 	}
 
-	// Parse all lines
-	type parsedEntry struct {
-		ttype     string
+	type contentBlock struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+
+	// Collect assistant entries from the tail
+	type entry struct {
 		requestID string
-		role      string
 		content   json.RawMessage
 	}
 
-	var entries []parsedEntry
+	var entries []entry
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024) // 10MB max line
+	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -377,123 +356,67 @@ func extractLastTurn(transcriptPath string) []string {
 		if json.Unmarshal(line, &tl) != nil {
 			continue
 		}
-		// Use nested message fields if present, otherwise fall back to root-level fields
-		role := tl.Message.Role
-		content := tl.Message.Content
-		if role == "" {
-			role = tl.Role
+		if tl.Type != "assistant" || tl.Message.Role != "assistant" {
+			continue
 		}
-		if len(content) == 0 {
-			content = tl.Content
+		if tl.IsApiErrorMessage || tl.RequestID == "" {
+			continue
 		}
-		entries = append(entries, parsedEntry{
-			ttype:     tl.Type,
+		entries = append(entries, entry{
 			requestID: tl.RequestID,
-			role:      role,
-			content:   content,
+			content:   tl.Message.Content,
 		})
 	}
 
-	if len(entries) == 0 {
-		return nil
+	// Take only the tail
+	if len(entries) > tailCount {
+		entries = entries[len(entries)-tailCount:]
 	}
 
-	// Find the last assistant entry, then search backwards from there
-	// for the real user message that started the turn. This avoids the
-	// race where the user types a new message before the stop hook fires,
-	// which would cause us to miss the previous turn's assistant reply.
-	lastAssistantIdx := -1
-	for i := len(entries) - 1; i >= 0; i-- {
-		e := entries[i]
-		if e.ttype == "assistant" || e.role == "assistant" {
-			lastAssistantIdx = i
-			break
-		}
+	// For each requestId, keep only the last entry's text (later entries
+	// supersede earlier ones for the same request, e.g. streaming updates)
+	type ridText struct {
+		requestID string
+		texts     []string
 	}
-	if lastAssistantIdx < 0 {
-		return nil
-	}
+	seen := make(map[string]int) // requestID -> index in result
+	var ordered []ridText
 
-	startIdx := 0
-	for i := lastAssistantIdx; i >= 0; i-- {
-		e := entries[i]
-		if e.ttype != "user" && e.role != "user" {
-			continue
-		}
-		if isToolResult(e.content) {
-			continue
-		}
-		startIdx = i + 1
-		break
-	}
-
-	reqTexts := make(map[string][]string) // requestId -> text blocks from last entry
-	var orderedKeys []string              // preserve order of first appearance
-	var noIDTexts []string                // texts from entries without requestId
-
-	for i := startIdx; i < len(entries); i++ {
-		e := entries[i]
-		if e.ttype != "assistant" && e.role != "assistant" {
-			continue
-		}
-
+	for _, e := range entries {
 		var blocks []contentBlock
 		if json.Unmarshal(e.content, &blocks) != nil {
 			continue
 		}
-
-		var entryTexts []string
+		var texts []string
 		for _, b := range blocks {
 			if b.Type != "text" {
 				continue
 			}
-			text := strings.TrimSpace(b.Text)
-			if text != "" && text != "(no content)" {
-				entryTexts = append(entryTexts, text)
+			t := strings.TrimSpace(b.Text)
+			if t != "" && t != "(no content)" {
+				texts = append(texts, t)
 			}
 		}
-
-		if len(entryTexts) == 0 {
+		if len(texts) == 0 {
 			continue
 		}
-
-		if e.requestID == "" {
-			noIDTexts = append(noIDTexts, entryTexts...)
+		if idx, ok := seen[e.requestID]; ok {
+			ordered[idx].texts = texts // overwrite with later entry
 		} else {
-			if _, seen := reqTexts[e.requestID]; !seen {
-				orderedKeys = append(orderedKeys, e.requestID)
-			}
-			reqTexts[e.requestID] = entryTexts // last entry with text wins
+			seen[e.requestID] = len(ordered)
+			ordered = append(ordered, ridText{requestID: e.requestID, texts: texts})
 		}
 	}
 
-	var texts []string
-	for _, key := range orderedKeys {
-		texts = append(texts, reqTexts[key]...)
-	}
-	texts = append(texts, noIDTexts...)
-
-	return texts
-}
-
-// isToolResult checks if content JSON contains tool_result entries
-func isToolResult(content json.RawMessage) bool {
-	if len(content) == 0 {
-		return false
-	}
-	// Try as array of objects
-	var blocks []struct {
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(content, &blocks) == nil {
-		for _, b := range blocks {
-			if b.Type == "tool_result" {
-				return true
-			}
+	var result []assistantTextBlock
+	for _, rt := range ordered {
+		for _, t := range rt.texts {
+			result = append(result, assistantTextBlock{requestID: rt.requestID, text: t})
 		}
 	}
-	return false
+	return result
 }
+
 
 func handlePermissionHook() error {
 	defer func() { recover() }()
