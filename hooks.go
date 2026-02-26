@@ -31,6 +31,33 @@ func clearThinking(sessionName string) {
 	os.Remove(thinkingFlag(sessionName))
 }
 
+// promptAckPath returns the path of the ack file that confirms
+// Claude received a prompt sent from Telegram via tmux send-keys.
+func promptAckPath(sessionName string) string {
+	return filepath.Join(cacheDir(), "prompt-ack-"+sessionName)
+}
+
+func writePromptAck(sessionName string) {
+	os.WriteFile(promptAckPath(sessionName), []byte("1"), 0600)
+}
+
+func clearPromptAck(sessionName string) {
+	os.Remove(promptAckPath(sessionName))
+}
+
+// waitPromptAck polls for the ack file, returning true if it appears within timeout
+func waitPromptAck(sessionName string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(promptAckPath(sessionName)); err == nil {
+			os.Remove(promptAckPath(sessionName))
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
+}
+
 // toolStatePath returns the path for tool call display state
 func toolStatePath(sessionName string) string {
 	return filepath.Join(cacheDir(), "tools-"+sessionName+".json")
@@ -281,7 +308,13 @@ func handleStopHook() error {
 		}
 
 		hookLog("stop-hook: sending rid=%s len=%d preview=%s", block.requestID, len(block.text), truncate(block.text, 80))
-		tgMsgID, _ := sendMessageGetID(config, config.GroupID, topicID, fmt.Sprintf("*%s:*\n%s", sessName, block.text))
+		msg := fmt.Sprintf("*%s:*\n%s", sessName, block.text)
+		tgMsgID, err := sendMessageGetID(config, config.GroupID, topicID, msg)
+		if err != nil {
+			hookLog("stop-hook: send failed, retrying: %v", err)
+			time.Sleep(500 * time.Millisecond)
+			tgMsgID, _ = sendMessageGetID(config, config.GroupID, topicID, msg)
+		}
 
 		appendMessage(&MessageRecord{
 			ID:                blockID,
@@ -649,6 +682,7 @@ func handleUserPromptHook() error {
 	if flagInfo, err := os.Stat(telegramActiveFlag(tmuxName)); err == nil {
 		if time.Since(flagInfo.ModTime()) < 30*time.Second {
 			os.Remove(telegramActiveFlag(tmuxName))
+			writePromptAck(sessName)
 			setThinking(sessName)
 			// Record: came from Telegram, both sides have it
 			appendMessage(&MessageRecord{

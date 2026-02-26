@@ -206,6 +206,11 @@ func runClaudeRaw(continueSession bool) error {
 
 // waitForClaude polls the tmux pane until Claude Code's input prompt appears
 func waitForClaude(target string, timeout time.Duration) error {
+	// Poll faster for short timeouts (message sending), slower for startup
+	interval := 100 * time.Millisecond
+	if timeout > 10*time.Second {
+		interval = 500 * time.Millisecond
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		cmd := exec.Command(tmuxPath, "capture-pane", "-t", target, "-p")
@@ -217,7 +222,7 @@ func waitForClaude(target string, timeout time.Duration) error {
 				return nil
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(interval)
 	}
 	return fmt.Errorf("timeout waiting for Claude to start")
 }
