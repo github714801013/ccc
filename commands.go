@@ -299,7 +299,8 @@ func setup(botToken string) error {
 
 	offset := 0
 	for {
-		resp, err := telegramGet(botToken, fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", botToken, offset))
+		client := getTelegramClient(&Config{BotToken: botToken})
+		resp, err := telegramClientGet(client, botToken, fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", botToken, offset))
 		if err != nil {
 			return fmt.Errorf("failed to get updates: %w", err)
 		}
@@ -341,7 +342,7 @@ step2:
 	// Non-blocking check for group message with timeout
 	fmt.Println("   Waiting 30 seconds for group message...")
 
-	client := &http.Client{Timeout: 35 * time.Second}
+	client := getTelegramClient(config)
 	deadline := time.Now().Add(30 * time.Second)
 
 	for time.Now().Before(deadline) {
@@ -728,7 +729,7 @@ func listen() error {
 
 	listenLog("Bot started (chat: %d, group: %d, sessions: %d)", config.ChatID, config.GroupID, len(config.Sessions))
 
-	setBotCommands(config.BotToken)
+	setBotCommands(config)
 
 	// Recover undelivered Telegram messages from ledger
 	for sessName, info := range config.Sessions {
@@ -748,7 +749,7 @@ func listen() error {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	offset := 0
-	client := &http.Client{Timeout: 35 * time.Second}
+	client := getTelegramClient(config)
 
 	go func() {
 		sig := <-sigChan
@@ -794,7 +795,7 @@ func listen() error {
 
 		var updates TelegramUpdate
 		if err := json.Unmarshal(body, &updates); err != nil {
-			listenLog("Parse error: %v", err)
+			listenLog("Parse error: %v (body: %s)", err, string(body))
 			time.Sleep(time.Second)
 			continue
 		}
@@ -805,18 +806,23 @@ func listen() error {
 			continue
 		}
 
+		if len(updates.Result) > 0 {
+			listenLog("Received %d updates", len(updates.Result))
+		}
+
 		for _, update := range updates.Result {
 			offset = update.UpdateID + 1
 
 			// Handle callback queries (button presses)
 			if update.CallbackQuery != nil {
 				cb := update.CallbackQuery
-				// Only accept from authorized user
-				if cb.From.ID != config.ChatID {
+				// Only accept from authorized user or group
+				if cb.From.ID != config.ChatID && cb.From.ID != config.GroupID {
+					listenLog("Skipping callback query from unauthorized user ID %d (chat=%d group=%d)", cb.From.ID, config.ChatID, config.GroupID)
 					continue
 				}
 
-					answerCallbackQuery(config, cb.ID)
+				answerCallbackQuery(config, cb.ID)
 
 				// Parse callback data: session:questionIndex:totalQuestions:optionIndex
 				parts := strings.Split(cb.Data, ":")
@@ -865,8 +871,11 @@ func listen() error {
 
 			msg := update.Message
 
-			// Only accept from authorized user
-			if msg.From.ID != config.ChatID {
+			// Only accept from authorized user or group
+			isFromAuthorizedUser := msg.From.ID == config.ChatID
+			isFromAuthorizedGroup := msg.Chat.ID == config.GroupID
+			
+			if !isFromAuthorizedUser && !isFromAuthorizedGroup {
 				continue
 			}
 
@@ -1239,21 +1248,21 @@ func listen() error {
 
 				// Without args - restart session in current topic
 				if threadID > 0 {
-					sessionName := getSessionByTopic(config, threadID)
-					if sessionName == "" {
+					sessName := getSessionByTopic(config, threadID)
+					if sessName == "" {
 						sendMessage(config, chatID, threadID, "❌ No session mapped to this topic. Use /new <name> to create one.")
 						continue
 					}
-					tmuxName := tmuxSafeName(sessionName)
-					windowID := getWindowID(config, sessionName)
+					tmuxName := tmuxSafeName(sessName)
+					windowID := getWindowID(config, sessName)
 					if tmuxWindowExistsByID(windowID, tmuxName) {
 						killTmuxWindow(windowID, tmuxName)
 						time.Sleep(300 * time.Millisecond)
 					}
-					sessionInfo := config.Sessions[sessionName]
+					sessionInfo := config.Sessions[sessName]
 					workDir := sessionInfo.Path
 					if workDir == "" {
-						workDir = resolveProjectPath(config, sessionName)
+						workDir = resolveProjectPath(config, sessName)
 					}
 					if _, err := os.Stat(workDir); os.IsNotExist(err) {
 						os.MkdirAll(workDir, 0755)
@@ -1262,11 +1271,11 @@ func listen() error {
 					if err != nil {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to start: %v", err))
 					} else {
-						config.Sessions[sessionName].WindowID = newWindowID
+						config.Sessions[sessName].WindowID = newWindowID
 						saveConfig(config)
 						time.Sleep(500 * time.Millisecond)
 						if tmuxWindowExistsByID(newWindowID, tmuxName) {
-							sendMessage(config, chatID, threadID, fmt.Sprintf("🚀 Session '%s' restarted", sessionName))
+							sendMessage(config, chatID, threadID, fmt.Sprintf("🚀 Session '%s' restarted", sessName))
 						} else {
 							sendMessage(config, chatID, threadID, "⚠️ Session died immediately")
 						}

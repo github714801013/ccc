@@ -26,8 +26,38 @@ func redactTokenError(err error, token string) error {
 	return fmt.Errorf("%s", strings.ReplaceAll(err.Error(), token, "***"))
 }
 
+// getTelegramClient returns an http.Client with proxy support if configured
+func getTelegramClient(config *Config) *http.Client {
+	client := &http.Client{Timeout: 35 * time.Second}
+	proxySource := "none"
+	if config != nil && config.ProxyURL != "" {
+		proxyURL, err := url.Parse(config.ProxyURL)
+		if err == nil {
+			client.Transport = &http.Transport{
+				Proxy: http.ProxyURL(proxyURL),
+			}
+			proxySource = config.ProxyURL
+		} else {
+			proxySource = fmt.Sprintf("error parsing %s: %v", config.ProxyURL, err)
+		}
+	} else if os.Getenv("HTTPS_PROXY") != "" {
+		proxySource = "env: " + os.Getenv("HTTPS_PROXY")
+	} else if os.Getenv("http_proxy") != "" {
+		proxySource = "env: " + os.Getenv("http_proxy")
+	}
+	
+	// We use listenLog if we can, but since this is a utility, we'll just log if needed
+	// For now, let's assume listenLog is available or just use fmt for low-level init
+	if os.Getenv("CCC_DEBUG") == "1" {
+		fmt.Printf("[debug] HTTP client initialized with proxy: %s\n", proxySource)
+	}
+	return client
+}
+
 // telegramGet performs an HTTP GET and redacts the bot token from any errors
 func telegramGet(token string, url string) (*http.Response, error) {
+	// Note: this global version doesn't have config for proxy, 
+	// but most callers have config. We'll update them.
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, redactTokenError(err, token)
@@ -138,7 +168,8 @@ func updateCCC(config *Config, chatID, threadID int64, offset int) {
 
 func telegramAPI(config *Config, method string, params url.Values) (*TelegramResponse, error) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/%s", config.BotToken, method)
-	resp, err := http.PostForm(apiURL, params)
+	client := getTelegramClient(config)
+	resp, err := client.PostForm(apiURL, params)
 	if err != nil {
 		return nil, redactTokenError(err, config.BotToken)
 	}
@@ -392,7 +423,8 @@ func sendFile(config *Config, chatID int64, threadID int64, filePath string, cap
 	io.Copy(part, file)
 	writer.Close()
 
-	resp, err := http.Post(
+	client := getTelegramClient(config)
+	resp, err := client.Post(
 		fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", config.BotToken),
 		writer.FormDataContentType(),
 		body,
@@ -498,7 +530,8 @@ func deleteForumTopic(config *Config, topicID int64) error {
 }
 
 // setBotCommands sets the bot commands in Telegram
-func setBotCommands(botToken string) {
+func setBotCommands(config *Config) {
+	botToken := config.BotToken
 	commands := []map[string]string{
 		{"command": "new", "description": "Create/restart session: /new <name>"},
 		{"command": "delete", "description": "Delete current session and thread"},
@@ -511,11 +544,13 @@ func setBotCommands(botToken string) {
 		{"command": "auth", "description": "Re-authenticate Claude OAuth"},
 	}
 
+	client := getTelegramClient(config)
+
 	// Set for default scope
 	defaultBody, _ := json.Marshal(map[string]interface{}{
 		"commands": commands,
 	})
-	resp, err := http.Post(
+	resp, err := client.Post(
 		fmt.Sprintf("https://api.telegram.org/bot%s/setMyCommands", botToken),
 		"application/json",
 		bytes.NewReader(defaultBody),
@@ -529,7 +564,7 @@ func setBotCommands(botToken string) {
 		"commands": commands,
 		"scope":    map[string]string{"type": "all_group_chats"},
 	})
-	resp, err = http.Post(
+	resp, err = client.Post(
 		fmt.Sprintf("https://api.telegram.org/bot%s/setMyCommands", botToken),
 		"application/json",
 		bytes.NewReader(groupBody),

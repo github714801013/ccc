@@ -26,6 +26,7 @@ type Config struct {
 	ProjectsDir      string                  `json:"projects_dir,omitempty"`      // Base directory for new projects (default: ~)
 	TranscriptionLang string                  `json:"transcription_lang,omitempty"` // Language code for whisper (e.g. "es", "en")
 	RelayURL         string                  `json:"relay_url,omitempty"`         // Relay server URL for large file transfers
+	ProxyURL         string                  `json:"proxy_url,omitempty"`         // HTTP/HTTPS proxy URL
 	Away             bool                    `json:"away"`
 	OAuthToken       string                  `json:"oauth_token,omitempty"`
 	OTPSecret        string                  `json:"otp_secret,omitempty"`        // TOTP secret for safe mode
@@ -221,6 +222,11 @@ func main() {
 		if len(os.Args) < 3 {
 			// Show current config
 			fmt.Printf("projects_dir: %s\n", getProjectsDir(config))
+			if config.ProxyURL != "" {
+				fmt.Printf("proxy_url: %s\n", config.ProxyURL)
+			} else {
+				fmt.Println("proxy_url: not set")
+			}
 			if config.OAuthToken != "" {
 				fmt.Println("oauth_token: configured")
 			} else {
@@ -238,6 +244,7 @@ func main() {
 			}
 			fmt.Println("\nUsage: ccc config <key> <value>")
 			fmt.Println("  ccc config projects-dir ~/Projects")
+			fmt.Println("  ccc config proxy-url http://127.0.0.1:7890")
 			fmt.Println("  ccc config oauth-token <token>")
 			fmt.Println("  ccc config transcription-lang es")
 			os.Exit(0)
@@ -248,6 +255,8 @@ func main() {
 			switch key {
 			case "projects-dir":
 				fmt.Println(getProjectsDir(config))
+			case "proxy-url":
+				fmt.Println(config.ProxyURL)
 			case "oauth-token":
 				if config.OAuthToken != "" {
 					fmt.Println("configured")
@@ -287,6 +296,13 @@ func main() {
 				os.Exit(1)
 			}
 			fmt.Printf("✅ projects_dir set to: %s\n", getProjectsDir(config))
+		case "proxy-url":
+			config.ProxyURL = value
+			if err := saveConfig(config); err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("✅ proxy_url set to: %s\n", value)
 		case "oauth-token":
 			config.OAuthToken = value
 			if err := saveConfig(config); err != nil {
