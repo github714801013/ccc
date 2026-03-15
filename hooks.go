@@ -393,10 +393,13 @@ func extractRecentAssistantTexts(transcriptPath string, tailCount int) []assista
 	defer f.Close()
 
 	type transcriptLine struct {
-		Type             string `json:"type"`
-		RequestID        string `json:"requestId,omitempty"`
-		IsApiErrorMessage bool  `json:"isApiErrorMessage,omitempty"`
-		Message          struct {
+		Type              string `json:"type"`
+		RequestID         string `json:"requestId,omitempty"`
+		RequestID_Alt     string `json:"request_id,omitempty"` // Support newer versions
+		Uuid              string `json:"uuid,omitempty"`       // Fallback for newer versions
+		IsApiErrorMessage bool   `json:"isApiErrorMessage,omitempty"`
+		Message           struct {
+			ID      string          `json:"id,omitempty"` // msg_...
 			Role    string          `json:"role"`
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
@@ -443,14 +446,27 @@ func extractRecentAssistantTexts(transcriptPath string, tailCount int) []assista
 		if json.Unmarshal(line, &tl) != nil {
 			continue
 		}
+
+		// Use best available ID
+		rid := tl.RequestID
+		if rid == "" {
+			rid = tl.RequestID_Alt
+		}
+		if rid == "" {
+			rid = tl.Message.ID
+		}
+		if rid == "" {
+			rid = tl.Uuid
+		}
+
 		if tl.Type != "assistant" || tl.Message.Role != "assistant" {
 			continue
 		}
-		if tl.IsApiErrorMessage || tl.RequestID == "" {
+		if tl.IsApiErrorMessage || rid == "" {
 			continue
 		}
 		entries = append(entries, entry{
-			requestID: tl.RequestID,
+			requestID: rid,
 			content:   tl.Message.Content,
 		})
 	}
@@ -965,6 +981,13 @@ func installHook() error {
 
 	// Remove ALL existing ccc hooks from all hook types
 	allHookTypes := []string{"Stop", "Notification", "PermissionRequest", "PostToolUse", "PreToolUse", "UserPromptSubmit"}
+	
+	// Also explicitly remove old/invalid keys that cause "Settings Error"
+	invalidKeys := []string{"onNotification", "onPostToolUse", "onPreToolUse", "onStop", "onUserPromptSubmit"}
+	for _, key := range invalidKeys {
+		delete(hooks, key)
+	}
+
 	for _, hookType := range allHookTypes {
 		if existing, ok := hooks[hookType].([]interface{}); ok {
 			filtered := removeCccHooks(existing)
