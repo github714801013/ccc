@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -96,8 +97,6 @@ func startSession(continueSession bool) error {
 	if err != nil {
 		return err
 	}
-	name := filepath.Base(cwd)
-	winName := tmuxSafeName(name)
 
 	// Load config to check/create topic
 	config, err := loadConfig()
@@ -105,6 +104,28 @@ func startSession(continueSession bool) error {
 		// No config, just run claude directly
 		return runClaudeRaw(continueSession)
 	}
+
+	// Try to find existing session by path first to avoid collisions
+	var name string
+	for n, info := range config.Sessions {
+		if info != nil && info.Path == cwd {
+			name = n
+			break
+		}
+	}
+
+	if name == "" {
+		// New session or no path match
+		name = filepath.Base(cwd)
+		// Check for name collision with a different path
+		if info, exists := config.Sessions[name]; exists && info.Path != cwd {
+			// Collision! Append a short hash of the path
+			h := fnv.New32a()
+			h.Write([]byte(cwd))
+			name = fmt.Sprintf("%s_%x", name, h.Sum32())
+		}
+	}
+	winName := tmuxSafeName(name)
 
 	// Create topic if it doesn't exist and we have a group configured
 	if config.GroupID != 0 {

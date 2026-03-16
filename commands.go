@@ -677,12 +677,15 @@ func send(message string) error {
 	// Try to send to session topic if we're in a session directory
 	if config.GroupID != 0 {
 		cwd, _ := os.Getwd()
-		for name, info := range config.Sessions {
-			if info == nil {
+		for _, info := range config.Sessions {
+			if info == nil || info.Path == "" {
 				continue
 			}
-			// Match against saved path, subdirectories of saved path, or suffix
-			if cwd == info.Path || strings.HasPrefix(cwd, info.Path+"/") || strings.HasSuffix(cwd, "/"+name) {
+			// Match against saved path or subdirectories of saved path.
+			// filepath.Rel returns a path relative to info.Path.
+			// If it doesn't start with "..", cwd is info.Path or a subdirectory.
+			rel, err := filepath.Rel(info.Path, cwd)
+			if err == nil && !strings.HasPrefix(rel, "..") {
 				return sendMessage(config, config.GroupID, info.TopicID, message)
 			}
 		}
